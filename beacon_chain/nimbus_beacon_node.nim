@@ -2302,10 +2302,19 @@ proc run*(node: BeaconNode, stopper: StopFuture) {.raises: [CatchableError].} =
     wallTime = node.beaconClock.now()
     wallSlot = wallTime.slotOrZero(node.dag.timeParams)
 
+  # Like `asyncSpawn`, but cancelled before `stop` closes what the tasks use
+  var tasks: seq[FutureBase]
+  template spawn(task: untyped) =
+    let fut = FutureBase(task)
+    fut.addCallback(proc(udata: pointer) {.gcsafe, raises: [].} =
+      if fut.failed():
+        raise (ref FutureDefect)(msg: "Task failed: " & fut.error.msg))
+    tasks.add fut
+
   node.startLightClient()
   node.syncOverseer.start()
-  asyncSpawn node.getBlobsService.run()
-  asyncSpawn node.columnReconstructionBackfiller.run()
+  spawn node.getBlobsService.run()
+  spawn node.columnReconstructionBackfiller.run()
 
   waitFor node.updateGossipStatus(wallSlot)
 
@@ -2317,12 +2326,12 @@ proc run*(node: BeaconNode, stopper: StopFuture) {.raises: [CatchableError].} =
     # (because the updates to our validator pool are not atomic).
     # Consider using different strategies that would detect such
     # race conditions.
-    asyncSpawn node.pollForDynamicValidators(
+    spawn node.pollForDynamicValidators(
       web3signerUrl, node.config.web3signerUpdateInterval)
 
-  asyncSpawn runSlotLoop(node, wallTime)
-  asyncSpawn runOnSecondLoop(node)
-  asyncSpawn runKeystoreCachePruningLoop(node.keystoreCache)
+  spawn runSlotLoop(node, wallTime)
+  spawn runOnSecondLoop(node)
+  spawn runKeystoreCachePruningLoop(node.keystoreCache)
 
   while true:
     if (let reason = ProcessState.stopping(); reason.isSome()):
@@ -2334,6 +2343,7 @@ proc run*(node: BeaconNode, stopper: StopFuture) {.raises: [CatchableError].} =
     chronos.poll()
 
   # time to say goodbye
+  waitFor cancelAndWait(tasks)
   node.stop()
 
 when not defined(windows):

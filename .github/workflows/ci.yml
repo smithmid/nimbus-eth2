@@ -99,24 +99,160 @@ jobs:
       test-command: *test
 
   build-asan:
-    # UBSAN on recent enough gcc, for 1 in 16 commits
-    if: startsWith(github.sha, '7')
+    name: 'build-asan (${{ matrix.tests }}, ${{ matrix.mm }})'
+    strategy:
+      fail-fast: false
+      matrix:
+        tests: [spectests, alltests]
+        mm: [refc, orc]
+        include: &mm-nim-versions
+          - mm: refc
+            nim-versions: '["./vendor/nimbus-build-system/vendor/Nim", "version-2-2", "version-2-4"]'
+          - mm: orc
+            nim-versions: '["version-2-4"]'
     uses: status-im/nimbus-common-workflow/.github/workflows/common.yml@a7b20ad8dbee60830223c2f2a86eaf5e1aa696ba  # main
     with:
-      targets: '[{"linux-amd64": ["self-hosted", "ubuntu-22.04"]}]'
-      nim-versions: '["./vendor/nimbus-build-system/vendor/Nim", "version-2-2", "version-2-4"]'
-      concurrency-suffix: asan
+      targets: '["linux-amd64", "linux-arm64", "macos-arm64", "windows-amd64"]'
+      nim-versions: ${{ matrix.nim-versions }}
+      concurrency-suffix: asan-${{ matrix.tests }}-${{ matrix.mm }}
       install-command: *install
       test-command: |
-        export WITH_UBSAN=1
-        export NIMFLAGS="${NIMFLAGS} --passC:-fsanitize=undefined --passL:-fsanitize=undefined"
+        san_flags=("-fsanitize=address,undefined" -fno-sanitize-recover=undefined -fno-sanitize-merge -fno-omit-frame-pointer)
+        # Nim's signal handler would replace the sanitizers' and dies silently on stack overflows
+        NIMFLAGS="--cc:clang --debugger:native -d:disableLTO -d:noSignalHandler"
+        for flag in "${san_flags[@]}"; do
+          NIMFLAGS+=" --passC:${flag}"
+        done
+        NIMFLAGS+=" --passL:-fsanitize=address,undefined"
+        # hashtree's arm64 assembly goes through GNU as, which rejects clang's -march=native
+        if [[ "${RUNNER_OS}" == "Linux" && "${CPU}" == "arm64" ]]; then
+          NIMFLAGS+=" -d:disableMarchNative"
+        fi
+        # orc if requested, else refc from config.nims
+        mm="${{ matrix.mm }}"
+        if [[ "${mm}" == orc ]]; then
+          NIMFLAGS+=" --mm:orc -d:useMalloc"
+          export ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1"
+        else
+          export ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=0"
+        fi
+        export NIMFLAGS
+        export UBSAN_OPTIONS="print_stacktrace=1"
+
+        # make checks `which $(CC)`, so test_libnimbus_lc gets the flags through a wrapper
+        # (forward slashes, as make's shell would drop the backslashes of Windows paths)
+        cc_san="${RUNNER_TEMP//\\//}/cc-san"
+        {
+          echo '#!/bin/sh'
+          echo "exec clang ${san_flags[*]} \"\$@\""
+        } > "${cc_san}"
+        chmod +x "${cc_san}"
+
+        # Nim archives clang static libraries with llvm-ar, which the Ubuntu images lack
+        if ! command -v llvm-ar >/dev/null; then
+          mkdir -p "${RUNNER_TEMP}/bin"
+          ln -s "$(command -v ar)" "${RUNNER_TEMP}/bin/llvm-ar"
+          export PATH="${RUNNER_TEMP}/bin:${PATH}"
+        fi
 
         echo "::group::Get the Ethereum Foundation fixtures"
         scripts/setup_scenarios.sh fixturesCache
         echo "::endgroup::"
 
+        # orc's frames reach 106 MiB with ASAN (nim-lang/Nim#26565); macOS allows at most 512 MiB
+        if [[ "${mm}" == orc ]]; then
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            NIMFLAGS+=" --passL:-Wl,--stack,536870912"
+          elif [[ "${RUNNER_OS}" == "macOS" ]]; then
+            NIMFLAGS+=" --passL:-Wl,-stack_size,0x20000000"
+          else
+            ulimit -s 524288
+          fi
+        fi
+
+        tests="${{ matrix.tests }}"
+        if [[ "${tests}" == spectests ]]; then
+          selection=("XML_TEST_BINARIES=\$(XML_TEST_BINARIES_CORE)" TEST_BINARIES=)
+        else
+          selection=(XML_TEST_BINARIES_CORE=)
+        fi
+        # Nim's signal handler also ignores SIGPIPE
+        trap '' PIPE
         echo "::group::Run tests"
-        ${make_cmd} -j "${ncpu}" V=1 USE_SYSTEM_NIM=1 DISABLE_TEST_FIXTURES_SCRIPT=1 test | filter_cc
+        ${make_cmd} -j "${ncpu}" V=1 USE_SYSTEM_NIM=1 CC="${cc_san}" DISABLE_TEST_FIXTURES_SCRIPT=1 "${selection[@]}" test | filter_cc
+        echo "::endgroup::"
+
+  build-tsan:
+    # Only the tests that reach nimbus-eth2's own taskpool code
+    name: 'build-tsan (${{ matrix.mm }})'
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [refc, orc]
+        include: *mm-nim-versions
+    uses: status-im/nimbus-common-workflow/.github/workflows/common.yml@a7b20ad8dbee60830223c2f2a86eaf5e1aa696ba  # main
+    with:
+      targets: '["linux-amd64", "linux-arm64", "macos-arm64"]'
+      nim-versions: ${{ matrix.nim-versions }}
+      concurrency-suffix: tsan-${{ matrix.mm }}
+      install-command: *install
+      test-command: |
+        san_flags=("-fsanitize=thread,undefined" -fno-sanitize-recover=undefined -fno-sanitize-merge -fno-omit-frame-pointer)
+
+        # `make test`'s test binary flags, plus TSAN
+        # (Nim's signal handler would replace the sanitizers' and dies silently on stack overflows)
+        nim_flags=(
+          -d:release "--parallelBuild:${ncpu}" -d:libp2p_agents_metrics
+          "-d:KnownLibP2PAgents=nimbus,lighthouse,lodestar,prysm,teku,grandine"
+          -d:chronicles_log_level=TRACE "-d:chronicles_sinks=json[file]"
+          --cc:clang --debugger:native -d:disableLTO -d:noSignalHandler
+          "--passL:-fsanitize=thread,undefined" -d:taskpoolsTsan)
+        for flag in "${san_flags[@]}"; do
+          nim_flags+=("--passC:${flag}")
+        done
+        # hashtree's arm64 assembly goes through GNU as, which rejects clang's -march=native
+        if [[ "${RUNNER_OS}" == "Linux" && "${CPU}" == "arm64" ]]; then
+          nim_flags+=(-d:disableMarchNative)
+        fi
+        # orc if requested, else refc from config.nims
+        mm="${{ matrix.mm }}"
+        if [[ "${mm}" == orc ]]; then
+          nim_flags+=(--mm:orc -d:useMalloc)
+        fi
+        export UBSAN_OPTIONS="print_stacktrace=1"
+
+        echo "::group::Build NAT libraries"
+        ${make_cmd} -j "${ncpu}" USE_SYSTEM_NIM=1 nat-libs
+        echo "::endgroup::"
+
+        export USE_SYSTEM_NIM=1
+        source env.sh
+
+        modules=(test_gossip_validation test_payload_attestation_pool test_block_processor test_peerdas_helpers)
+        echo "::group::Build tests"
+        for module in "${modules[@]}"; do
+          nim c "${nim_flags[@]}" -o:"build/tsan_${module}" "tests/${module}.nim"
+        done
+        echo "::endgroup::"
+
+        # orc's frames overflow macOS's 8 MiB main thread stack (nim-lang/Nim#26565)
+        if [[ "${mm}" == orc && "${RUNNER_OS}" == "macOS" ]]; then
+          ulimit -s "$(ulimit -Hs)"
+        fi
+
+        # Nim's signal handler also ignores SIGPIPE
+        trap '' PIPE
+        echo "::group::Run tests"
+        for module in "${modules[@]}"; do
+          "build/tsan_${module}" || {
+            status=$?
+            # macOS prints no backtrace for crashes, so rerun under lldb for one
+            if [[ "${RUNNER_OS}" == "macOS" ]]; then
+              lldb --batch -o run -k "thread backtrace all" -k quit -- "build/tsan_${module}"
+            fi
+            exit "${status}"
+          }
+        done
         echo "::endgroup::"
 
   build-dev:

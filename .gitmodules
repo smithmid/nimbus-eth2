@@ -9,7 +9,7 @@
 	path = vendor/nim-blscurve
 	url = https://github.com/status-im/nim-blscurve.git
 	ignore = untracked
-	branch = master
+	branch = dev/etan/oa-default
 [submodule "vendor/nim-confutils"]
 	path = vendor/nim-confutils
 	url = https://github.com/status-im/nim-confutils.git
@@ -59,7 +59,7 @@
 	path = vendor/nim-chronos
 	url = https://github.com/status-im/nim-chronos.git
 	ignore = untracked
-	branch = master
+	branch = dev/etan/ci-asan
 [submodule "vendor/nim-chronicles"]
 	path = vendor/nim-chronicles
 	url = https://github.com/status-im/nim-chronicles.git
@@ -84,7 +84,7 @@
 	path = vendor/nim-eth
 	url = https://github.com/status-im/nim-eth.git
 	ignore = untracked
-	branch = master
+	branch = dev/etan/oa-default
 [submodule "vendor/nim-stint"]
 	path = vendor/nim-stint
 	url = https://github.com/status-im/nim-stint.git

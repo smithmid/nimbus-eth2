@@ -181,6 +181,18 @@ proc advance_slot(
   ok()
 
 {.push warning[ProveField]:off.}  # https://github.com/nim-lang/Nim/issues/22060
+# ORC puts the upgraded state and a moved `newState[]` on the stack, so each
+# fork gets its own frame and `assign` replaces the move
+# https://github.com/nim-lang/Nim/issues/26565
+func upgradeStep[F: static ConsensusFork](
+    cfg: RuntimeConfig, state: var ForkedHashedBeaconState, cache: var StateCache
+) {.noinline.} =
+  const nextFork = succ(F)
+  let newState = (ref ForkedHashedBeaconState)(kind: nextFork)
+  newState[].forky(nextFork).data =
+    upgrade_to_next(cfg, state.forky(F).data, cache)
+  assign(state, newState[])
+
 func maybeUpgradeState*(
     cfg: RuntimeConfig, state: var ForkedHashedBeaconState, cache: var StateCache
 ) =
@@ -193,11 +205,7 @@ func maybeUpgradeState*(
     while state.kind < curFork:
       withState(state):
         when consensusFork < high(ConsensusFork):
-          const nextFork = succ(consensusFork)
-          let newState = (ref ForkedHashedBeaconState)(kind: nextFork)
-          newState[].forky(nextFork).data =
-            upgrade_to_next(cfg, state.forky(consensusFork).data, cache)
-          state = move(newState[])
+          upgradeStep[consensusFork](cfg, state, cache)
 
     withState(state):
       forkyState.root = hash_tree_root(forkyState.data)
